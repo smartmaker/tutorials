@@ -1,0 +1,294 @@
+// Hannah Self Test Code for Factory Bringup Rev3 20130528
+// Original code from Brandon Harris @electricimp
+// Updated and adapted to the Rev3 by Dimitri@smARtMAKER.org
+//
+// This program allows to test the basic functions of the Hannah development
+// board in order to verify that everything is working properly.
+//
+// It includes visual outputs on the board using the RGB LED and additional
+// information sent to the server log.
+//
+// How to use: plug an imp001 card and power up (blink it if necessary)
+// load the program and restart the device, in order to make sure the new
+// program will be loaded and running
+// The RGB LED will become blue and this means that all the different I2C
+// devices have benn tested succesfully (a confirmation will be in the logs)
+// Pression on the button #2 will turn ON the GREEN element of the LED
+// (Blue and Green will be ON together at the same time)
+// Pression on the button #1 will turn ON the RED element of the LED
+// (Blue and Red will be ON together, Green will be OFF)
+// A rotation on the potentiometer for at least 50% of the course will turn
+// the GREEN element of the LED ON alone, and this means that the board is OK
+//
+// The program can be used as source and example for the basic functions of
+// the Hannah development board Rev3 designed by Electric Imp, produced and
+// distributed by smARtMAKER (www.smartmaker.com)
+
+imp.configure("Hannah Test Rev3", [],[]);
+ 
+server.log("Hannah Test Started");
+server.log("Please make sure you are testing a Rev3 board!");
+ 
+//I2C Addresses Rev3 (different from the previous Rev2!!!)
+const i2c_ioexp = 0x7C;
+const i2c_temp  = 0x92; // this device is new in the Rev3
+const i2c_als   = 0xE8;
+const i2c_accel = 0x30; // this device is new in the Rev3
+ 
+//----------------------------------------
+//-- Configure I2C
+//----------------------------------------
+hardware.configure(I2C_89);
+local i2c = hardware.i2c89;
+ 
+//----------------------------------------
+// Variables to store whether we've seen
+//  hi values and low values
+//----------------------------------------
+local irqhilo  = 0;
+local btn1hilo = 0;
+local btn2hilo = 0;
+local pothi    = -1.0;
+local potlo    = 1.0;
+local potpass  = false;
+ 
+local led_r = 0;
+local led_g = 0;
+local led_b = 0;
+ 
+//----------------------------------------
+//-- IO Expander Functions
+//----------------------------------------
+local function ioexp_read(addr) {
+    local result = i2c.read(i2c_ioexp, format("%c", addr), 1);
+    if (result == null) {
+        server.log("i2c read fail");
+        return -1;
+    } else return result[0];
+}
+
+local function ioexp_write(addr, data) {
+    i2c.write(i2c_ioexp, format("%c%c",addr, data));
+}
+ 
+local function ioexp_writebit(addr, bitn, level) {
+    // read modify write
+    local reg = ioexp_read(addr);
+    reg = (level==0)?(reg&~(1<<bitn)) : (reg | (1<<bitn));
+    ioexp_write(addr, reg)
+}
+ 
+local function ioexp_modify_write(addr, data, mask) {
+   local reg = ioexp_read(addr);
+   reg = (reg & ~mask) | (data & mask);
+   ioexp_write(addr, reg);
+}
+ 
+local function ioexp_setpin(gpio, level) {
+    ioexp_writebit(gpio>=8?0x10:0x11, gpio&7, level?1:0);
+}
+ 
+local function ioexp_setdir(gpio, output) {
+    ioexp_writebit(gpio>=8?0x0e:0x0f, gpio&7, output?0:1);
+}
+ 
+local function ioexp_setpullup(gpio, enable) {
+    ioexp_writebit(gpio>=8?0x06:0x07, gpio&7, enable);
+}
+ 
+local function ioexp_setirqmask(gpio, enable) {
+    ioexp_writebit(gpio>=8?0x12:0x13, gpio&7, enable);
+}
+ 
+local function ioexp_setirqedge(gpio, rising, falling) {
+    local addr = 0x17 - (gpio>>2);
+    local mask = 0x03 << ((gpio&3)<<1);
+    local data = (2*falling + rising) << ((gpio&3)<<1);    
+    ioexp_modify_write(addr, data, mask);
+}
+ 
+local function ioexp_clearirq(gpio) {
+    ioexp_writebit(gpio>=8?0x18:0x19, gpio&7, 1);
+}
+ 
+local function ioexp_readpin(gpio) {
+    return (ioexp_read(gpio>=8?0x10:0x11)&(1<<(gpio&7)))?1:0;
+}
+ 
+local function ioexp_setled(gpio, led) {
+    ioexp_writebit(gpio>=8?0x20:0x21, gpio&7, led);
+}
+ 
+local function ioexp_update_leds(r,g,b) {
+    if(r != null)
+        led_r = r;
+    if(g != null)
+        led_g = g;
+    if(b != null)
+        led_b = b;
+    ioexp_write(0x3b, led_g);
+    ioexp_write(0x40, led_b);
+    ioexp_write(0x45, led_r);
+}
+ 
+//---------------------------------------------------------------
+// FAIL or PASS
+//---------------------------------------------------------------
+local function fail(str){
+    server.log("Hannah Test Failed: "+str);
+    ioexp_update_leds(10,0,0);
+    while(1){
+        imp.sleep(100);
+    }
+}
+ 
+local function pass(){
+    server.log("Hannah Test Passed");
+    ioexp_update_leds(0,10,0);
+    while(1){
+        imp.sleep(100);
+    }
+}
+ 
+// Processing Loop
+function poll() {
+ 
+    if( hardware.pin1.read() && !(irqhilo & 0x2)){
+        //server.log("IRQ New Hi Value")
+        irqhilo = irqhilo | 0x2;
+        led_b += 10;
+    }else if( !hardware.pin1.read() && !(irqhilo & 0x1)){
+        //server.log("IRQ New Lo Value")
+        irqhilo = irqhilo | 0x1;
+        led_b += 5;
+    }
+ 
+    //Clear all interrupts
+    i2c.write(i2c_ioexp, "\x18\xFF");
+    i2c.write(i2c_ioexp, "\x19\xFF");
+ 
+    //Read the Pot Value
+    //(the pot is directly connected to the PIN2 but activated by the i2c_ioexp)
+    local pot = (hardware.pin2.read()/65535.0);
+    if(pot < potlo){
+        potlo = pot;
+    }
+    if(pothi < pot){
+        pothi = pot;
+    }
+ 
+    if((pothi - potlo) > 0.5 && !potpass){
+        potpass = true;
+        led_b += 10;
+        server.log("Pot OK = "+pot);
+    }
+ 
+        
+ 
+    if(ioexp_readpin(0) && !(btn1hilo & 0x2) ){
+        //server.log("New btn1 hi value");
+        btn1hilo = btn1hilo | 0x2;
+        led_b += 5;
+    }else if( !ioexp_readpin(0) && !(btn1hilo & 0x1)){
+        server.log("Button 1 OK");
+        ioexp_update_leds(10,0,10);
+        btn1hilo = btn1hilo | 0x1;
+        led_b += 10;
+    }
+ 
+    if(ioexp_readpin(1) && !(btn2hilo & 0x2) ){
+        //server.log("New btn2 hi value");
+        btn2hilo = btn2hilo | 0x2;
+        led_b += 5;
+    }else if( !ioexp_readpin(1) && !(btn2hilo & 0x1)){
+        server.log("Button 2 OK");
+        ioexp_update_leds(0,10,10);
+        btn2hilo = btn2hilo | 0x1;
+        led_b += 10;
+    }
+ 
+    if(btn1hilo == 3 && btn2hilo == 3 && (pothi-potlo) > 0.5){
+        pass();
+    }else{
+        ioexp_update_leds(null,null,null);
+        imp.wakeup(0.1, poll);
+    }
+    
+}
+ 
+//LED Driver Enable
+ioexp_modify_write(0x01, 0xE0, 0xFF);
+ioexp_modify_write(0x0f, 0xE0, 0x00);
+ioexp_modify_write(0x0b, 0xE0, 0xFF);
+ioexp_modify_write(0x21, 0xE0, 0xFF);
+ioexp_write(0x1e, 0x50);
+ioexp_write(0x1f, 0x10);
+ioexp_update_leds(0,0,0);
+ioexp_setpin(5, 0);
+ioexp_setpin(6, 0);
+ioexp_setpin(7, 0);
+ 
+// Enable Button 1
+ioexp_setpullup(0, 1);
+ioexp_setirqmask(0, 0);
+ioexp_setirqedge(0, 1, 1); // Set for rising and falling
+ 
+// Enable Button 2
+ioexp_setpullup(1, 1);
+ioexp_setirqmask(1, 0);
+ioexp_setirqedge(1, 1, 1); // Set for rising and falling
+ 
+// Enable Hall Switch
+ioexp_setpullup(2,1);
+ioexp_setirqmask(2, 0);
+ioexp_setirqedge(2, 1, 1); // Set for rising and falling
+ 
+// Enable Potentiometer
+ioexp_setpin(8, 0);
+ioexp_setdir(8, 1);
+hardware.pin2.configure(ANALOG_IN);
+ 
+//ALS Enable
+ioexp_setdir(9, 1)
+ioexp_setpin(9, 0)    
+ 
+//Servo Power Enable
+ioexp_setdir(10, 1);
+ioexp_setpin(10, 1);
+ 
+//Servo PWMs
+hardware.pin5.configure(PWM_OUT, 0.020, 500, 1000);
+hardware.pin7.configure(PWM_OUT, 0.020, 500, 1000);
+ 
+//Configure Interrupt Pin
+hardware.pin1.configure(DIGITAL_IN);
+ 
+local e = 0;
+ 
+// In this case we only check the presence of the IC because it doesn't offer a register with ID
+e = i2c.read(i2c_temp, "\x01", 1);
+if(e == null){
+    fail("Can't Read Temp Sensor");
+} else {
+    server.log("Temperature sensor OK");
+}
+ 
+// the function reads the register 0Fh (Who I Am) and check that the result is correct: 33h
+e = i2c.read(i2c_accel, "\x0F", 1);
+if(e != "\x33"){
+    fail("Can't Enable Accelerometer");
+} else {
+    server.log("Accelerometer OK");
+}
+ 
+// In this case we only check the presence of the IC because it doesn't offer a register with ID
+e = i2c.read(i2c_als, "\x00", 1);
+if(e == null){
+    fail("Can't Read ALS");
+} else {
+    server.log("Color sensor OK");
+}
+ 
+ioexp_update_leds(0,0,10);
+ 
+poll();
